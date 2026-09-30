@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Script: automate_codemender_lab.sh (Hardened & Reviewed)
+# Script: automate_codemender_lab.sh (Updated with Git Push Fallback)
 # Purpose: End-to-end automation for ELEVATE Module 2 (CodeMender Guardrails)
 # ==============================================================================
 
@@ -122,7 +122,6 @@ ensure_github_repo() {
     log_success "Repository ${GITHUB_USER}/${REPO_NAME} exists."
   else
     log_info "Attempting automated repository creation..."
-    # Removed invalid --confirm flag
     if gh repo create "${REPO_NAME}" --public >/dev/null 2>&1; then
       log_success "Created public repository: ${GITHUB_USER}/${REPO_NAME}"
     else
@@ -225,9 +224,8 @@ sync_and_push_code() {
   fi
 
   git add .
-  if ! git rev-parse --verify HEAD >/dev/null 2>&1 || ! git diff-index --quiet HEAD -- 2>/dev/null; then
-    git commit -m "chore: starter files and guardrail workflow"
-  fi
+  # Always ensure a fresh commit is made so GitHub triggers an on:push event
+  git commit --allow-empty -m "ci: trigger continuous remediation guardrail [$(date +'%Y-%m-%d %H:%M:%S')]"
 
   log_info "Pushing code to origin/main (this triggers the guardrail workflow)..."
   git push -u origin main --force
@@ -245,31 +243,35 @@ trigger_and_monitor_workflow() {
   local run_id=""
   local start_time
   start_time=$(date +%s)
-  local detection_timeout=90
+  local detection_timeout=60
 
   while [ -z "$run_id" ] || [ "$run_id" = "null" ]; do
     sleep 3
+    
+    # Check matching commit SHA first
     run_id=$(gh run list --repo "${GITHUB_USER}/${REPO_NAME}" \
-      --workflow="$WORKFLOW_FILE" \
-      --commit "$PUSHED_COMMIT_SHA" \
-      --limit 1 \
-      --json databaseId -q '.[0].databaseId' 2>/dev/null || true)
+      --limit 5 \
+      --json databaseId,headSha \
+      -q '.[] | select(.headSha == "'"$PUSHED_COMMIT_SHA"'") | .databaseId' 2>/dev/null | head -n 1 || true)
 
-    # Fallback to newest run if commit filter indexing is delayed
     local elapsed=$(( $(date +%s) - start_time ))
+
+    # Fallback to any active run (queued or in_progress)
     if { [ -z "$run_id" ] || [ "$run_id" = "null" ]; } && [ "$elapsed" -gt 15 ]; then
       run_id=$(gh run list --repo "${GITHUB_USER}/${REPO_NAME}" \
-        --workflow="$WORKFLOW_FILE" \
-        --limit 1 \
-        --json databaseId,status -q '.[0].databaseId' 2>/dev/null || true)
+        --limit 5 \
+        --json databaseId,status \
+        -q '.[] | select(.status == "in_progress" or .status == "queued") | .databaseId' 2>/dev/null | head -n 1 || true)
     fi
 
     if { [ -z "$run_id" ] || [ "$run_id" = "null" ]; } && [ "$elapsed" -gt "$detection_timeout" ]; then
       log_warn "Workflow run not automatically detected after ${detection_timeout}s."
-      log_info "Dispatching workflow manually via workflow_dispatch..."
-      gh workflow run "$WORKFLOW_FILE" --repo "${GITHUB_USER}/${REPO_NAME}" --ref main
-      sleep 5
+      log_info "Attempting dispatch via new Git commit..."
+      git commit --allow-empty -m "ci: trigger guardrail retry"
+      git push origin main
+      PUSHED_COMMIT_SHA=$(git rev-parse HEAD)
       start_time=$(date +%s)
+      detection_timeout=45
     fi
   done
 
@@ -287,11 +289,15 @@ trigger_and_monitor_workflow() {
     local elapsed_fmt
     elapsed_fmt=$(printf "%02d:%02d" $((elapsed / 60)) $((elapsed % 60)))
 
-    # Fetch status and conclusion in a single query
+    # Fetch status and conclusion
     local run_json
     run_json=$(gh run view "$run_id" --repo "${GITHUB_USER}/${REPO_NAME}" --json status,conclusion 2>/dev/null || echo '{"status":"in_progress"}')
     current_status=$(echo "$run_json" | jq -r '.status // "in_progress"')
     conclusion=$(echo "$run_json" | jq -r '.conclusion // ""')
+
+    if [ "$current_status" = "completed" ]; then
+      break
+    fi
 
     local jobs_json
     jobs_json=$(gh api "/repos/${GITHUB_USER}/${REPO_NAME}/actions/runs/${run_id}/jobs" 2>/dev/null || echo "{}")
@@ -310,7 +316,7 @@ trigger_and_monitor_workflow() {
     local percent=5
     if [ "$total_steps" -gt 0 ]; then
       percent=$(( completed_steps * 100 / total_steps ))
-      if [ "$percent" -gt 95 ] && [ "$current_status" != "completed" ]; then
+      if [ "$percent" -gt 95 ]; then
         percent=95
       fi
     fi
@@ -322,9 +328,12 @@ trigger_and_monitor_workflow() {
   render_progress_bar 100 "Guardrail run completed!     "
   echo -e "\n"
 
-  # Deep inspection of step outcomes
-  local final_jobs
-  final_jobs=$(gh api "/repos/${GITHUB_USER}/${REPO_NAME}/actions/runs/${run_id}/jobs" 2>/dev/null || echo "{}")
+  # Deep inspection of step outcomes with retry
+  local final_jobs="{}"
+  for attempt in 1 2 3; do
+    final_jobs=$(gh api "/repos/${GITHUB_USER}/${REPO_NAME}/actions/runs/${run_id}/jobs" 2>/dev/null) && break || sleep 2
+  done
+  [ -z "$final_jobs" ] && final_jobs="{}"
 
   local install_status
   install_status=$(echo "$final_jobs" | jq -r '.jobs[0].steps[]? | select(.name == "Install CodeMender CLI") | .conclusion')
@@ -377,7 +386,8 @@ verify_remediation_artifacts() {
     log_success "Remediation Pull Request is OPEN: ${BOLD}${pr_url}${NC}"
   else
     log_warn "Remediation PR was not automatically opened. Checking branch for fallback creation..."
-    if gh api "/repos/${GITHUB_USER}/${REPO_NAME}/branches/codemender/auto-remediation" >/dev/null 2>&1; then
+    if gh api "/repos/${GITHUB_USER}/${REPO_NAME}/branches/codemender%2Fauto-remediation" >/dev/null 2>&1 || \
+       git ls-remote --heads origin codemender/auto-remediation | grep -q "codemender/auto-remediation"; then
       log_info "Branch 'codemender/auto-remediation' exists. Submitting fallback PR..."
       pr_url=$(gh pr create --repo "${GITHUB_USER}/${REPO_NAME}" \
         --head codemender/auto-remediation \
